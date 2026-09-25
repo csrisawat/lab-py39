@@ -1,0 +1,57 @@
+# DR runtime for lab-py39 on the AWS EC2 host (ap-southeast-7).
+# Generic upstream image, no Dockerfile, no image build.
+# Code is bind-mounted read-only from the host; the pipeline swaps the
+# /opt/apps/lab-py39/current symlink to a new release on every deploy.
+name: lab-py39
+
+services:
+  lab-py39:
+    image: python:3.9
+    container_name: lab-py39
+    restart: unless-stopped
+    working_dir: /app
+    # Non-secret config, deployed by the pipeline from dr/config.env
+    env_file: /opt/dr/lab-py39/config.env
+    environment:
+      PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    ports:
+      - "3002:8000"
+    volumes:
+      - /opt/apps/lab-py39/current:/app:ro
+    # Secrets are files on the host (root:root 600), mounted at
+    # /run/secrets/<TARGET>. Not visible in `docker inspect`.
+    secrets:
+      - source: db_password
+        target: DB_PASSWORD
+      - source: api_key
+        target: API_KEY
+    # 1) export every /run/secrets/<NAME> as env var NAME (no code change)
+    # 2) install deps into the container layer and start
+    # The app uses stdlib http.server (not WSGI), so start it with python, not gunicorn.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        for f in /run/secrets/*; do [ -f "$$f" ] && export "$$(basename "$$f")=$$(cat "$$f")"; done
+        pip install --no-cache-dir -q -r requirements.txt
+        exec python app.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+secrets:
+  db_password:
+    file: /opt/dr-secrets/lab-py39/DB_PASSWORD
+  api_key:
+    file: /opt/dr-secrets/lab-py39/API_KEY

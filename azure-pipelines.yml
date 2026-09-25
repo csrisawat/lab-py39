@@ -1,0 +1,174 @@
+# lab-py39 — Build -> Deploy_Azure (App Service SEA) -> Deploy_DR (EC2 docker compose, ap-southeast-7)
+#
+# Normal release (warm standby): push to main -> all three stages run.
+# During an Azure outage:        Run pipeline -> deployTarget = dr-only.
+# Failback:                      Run pipeline -> deployTarget = azure-only (or both).
+#
+# Pool: everything runs on the self-hosted agent on the DR EC2 (pool drlab-ec2), so the lab
+# works even without a Microsoft-hosted parallel job. Set useHostedAgent=true to run
+# Build + Deploy_Azure on Microsoft-hosted ubuntu-latest instead (needs the free grant).
+
+trigger:
+  branches:
+    include: [ main ]
+pr: none
+
+parameters:
+  - name: deployTarget
+    displayName: Deploy target
+    type: string
+    default: both
+    values: [ both, dr-only, azure-only ]
+  - name: useHostedAgent
+    displayName: Use Microsoft-hosted agent for Build/Deploy_Azure
+    type: boolean
+    default: false
+
+variables:
+  appId: lab-py39
+  drHostPort: '3002'
+  selfHostedPool: drlab-ec2
+  # --- set these after running azure/create-azure.sh ---
+  azureWebAppName: drlab-py39-CHANGEME
+  azureServiceConnection: sc-drlab-azure
+  # ADO Library variable group holding DB_PASSWORD and API_KEY (locked, secret).
+  # Plain variable group, NOT Key Vault-linked (Key Vault is assumed down in DR).
+  secretGroup: drlab-lab-py39-secrets
+
+stages:
+# ---------------------------------------------------------------------------
+- stage: Build
+  displayName: Package source
+  pool:
+    ${{ if eq(parameters.useHostedAgent, true) }}:
+      vmImage: ubuntu-latest
+    ${{ else }}:
+      name: ${{ variables.selfHostedPool }}
+  jobs:
+  - job: package
+    steps:
+    - checkout: self
+      clean: true
+      fetchDepth: 1
+    # git archive = tracked files only: no .git, no .env, no node_modules.
+    # No dependency install here: App Service (Oryx) and the DR container each run
+    # the install for their own runtime.
+    - bash: |
+        set -euo pipefail
+        git archive --format=zip -o "$(Build.ArtifactStagingDirectory)/app.zip" HEAD
+        unzip -l "$(Build.ArtifactStagingDirectory)/app.zip"
+      displayName: git archive -> app.zip
+    - publish: $(Build.ArtifactStagingDirectory)/app.zip
+      artifact: app
+
+# ---------------------------------------------------------------------------
+- stage: Deploy_Azure
+  displayName: Deploy to Azure App Service (primary)
+  dependsOn: Build
+  condition: and(succeeded(), ne('${{ parameters.deployTarget }}', 'dr-only'))
+  pool:
+    ${{ if eq(parameters.useHostedAgent, true) }}:
+      vmImage: ubuntu-latest
+    ${{ else }}:
+      name: ${{ variables.selfHostedPool }}
+  jobs:
+  - deployment: azure
+    environment: drlab-azure
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: app
+          - task: AzureWebApp@1
+            displayName: Zip deploy (Oryx builds on the App Service side)
+            inputs:
+              azureSubscription: ${{ variables.azureServiceConnection }}
+              appType: webAppLinux
+              appName: $(azureWebAppName)
+              package: $(Pipeline.Workspace)/app/app.zip
+          - bash: |
+              set -uo pipefail
+              url="https://$(azureWebAppName).azurewebsites.net/health"
+              for i in $(seq 1 30); do
+                if curl -fsS --max-time 10 "$url"; then echo; echo "Azure healthy"; exit 0; fi
+                sleep 10
+              done
+              echo "##vso[task.logissue type=error]Azure app did not become healthy: $url"; exit 1
+            displayName: Smoke test Azure /health
+
+# ---------------------------------------------------------------------------
+- stage: Deploy_DR
+  displayName: Deploy to DR (AWS EC2 docker compose)
+  dependsOn: [ Build, Deploy_Azure ]
+  condition: |
+    and(
+      eq(dependencies.Build.result, 'Succeeded'),
+      in(dependencies.Deploy_Azure.result, 'Succeeded', 'Skipped'),
+      ne('${{ parameters.deployTarget }}', 'azure-only')
+    )
+  variables:
+  - group: ${{ variables.secretGroup }}
+  jobs:
+  - deployment: dr
+    environment: drlab-dr-ec2          # approval check is configured on this environment
+    pool:
+      name: ${{ variables.selfHostedPool }}   # must be the agent ON the DR host
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: app
+          - bash: |
+              set -euo pipefail
+              APP="$(appId)"
+              BASE="/opt/apps/$APP"
+              REL="$BASE/releases/$(Build.BuildId)"
+              CFG="/opt/dr/$APP"
+              SEC="/opt/dr-secrets/$APP"
+
+              echo "== 1. code -> $REL"
+              sudo install -d -m 755 "$BASE/releases" "$CFG"
+              sudo rm -rf "$REL" && sudo install -d -m 755 "$REL"
+              sudo unzip -q -o "$(Pipeline.Workspace)/app/app.zip" -d "$REL"
+
+              echo "== 2. non-secret config + compose file -> $CFG"
+              sudo install -m 644 "$REL/dr/config.env"  "$CFG/config.env"
+              sudo install -m 644 "$REL/dr/compose.yml" "$CFG/compose.yml"
+
+              echo "== 3. secrets -> $SEC (root:root 600)"
+              umask 077
+              sudo install -d -m 700 -o root -g root /opt/dr-secrets "$SEC"
+              write_secret() {
+                local name="$1" val="$2"
+                if [ -z "$val" ] || [ "$val" = "\$($name)" ]; then
+                  echo "##vso[task.logissue type=error]Secret $name missing in variable group $(secretGroup)"; exit 1
+                fi
+                printf '%s' "$val" | sudo install -m 600 -o root -g root /dev/stdin "$SEC/$name"
+                echo "   $name written"
+              }
+              write_secret DB_PASSWORD "$SECRET_DB_PASSWORD"
+              write_secret API_KEY     "$SECRET_API_KEY"
+
+              echo "== 4. switch current -> this release, recreate container"
+              sudo ln -sfn "$REL" "$BASE/current"
+              sudo docker compose -f "$CFG/compose.yml" up -d --force-recreate --remove-orphans
+
+              echo "== 5. wait for /health on host port $(drHostPort)"
+              for i in $(seq 1 36); do
+                if curl -fsS --max-time 5 "http://127.0.0.1:$(drHostPort)/health"; then
+                  echo; echo "DR healthy"
+                  # keep the 3 newest releases
+                  ls -1dt "$BASE"/releases/* | tail -n +4 | xargs -r sudo rm -rf
+                  exit 0
+                fi
+                sleep 5
+              done
+              sudo docker logs --tail 50 "$APP" || true
+              echo "##vso[task.logissue type=error]DR container not healthy"; exit 1
+            displayName: Deploy code + config + secrets, docker compose up
+            env:
+              # Secret variables are never exposed to scripts unless mapped explicitly.
+              SECRET_DB_PASSWORD: $(DB_PASSWORD)
+              SECRET_API_KEY: $(API_KEY)

@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 import time
@@ -12,6 +13,7 @@ except ImportError:
 
 PORT = int(os.environ.get("PORT", 3000))
 APP_NAME = os.environ.get("APP_NAME", "lab-py39")
+APP_ENV = os.environ.get("APP_ENV", "local")
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 API_KEY = os.environ.get("API_KEY", "")
@@ -20,8 +22,10 @@ START_TIME = time.time()
 
 
 def masked_secret(val):
+    # Never print a secret. Show only whether it is set plus a short SHA-256
+    # fingerprint, so a rotation can be verified without revealing the value.
     if val:
-        return "***" + val[-4:]
+        return "set (sha256:" + hashlib.sha256(val.encode()).hexdigest()[:8] + ")"
     return "(not set)"
 
 
@@ -44,6 +48,7 @@ class Handler(BaseHTTPRequestHandler):
 <hr>
 <h3>Environment Config</h3>
 <ul>
+  <li><b>APP_ENV:</b> {APP_ENV}</li>
   <li><b>APP_NAME:</b> {APP_NAME}</li>
   <li><b>DB_HOST:</b> {DB_HOST}</li>
   <li><b>DB_PASSWORD:</b> {masked_secret(DB_PASSWORD)}</li>
@@ -62,6 +67,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"[{APP_NAME}] Server running on port {PORT}")
     print(f"  Python  = {sys.version.split()[0]}")
+    print(f"  APP_ENV = {APP_ENV}")
     print(f"  DB_HOST = {DB_HOST}")
     print(f"  DB_PASSWORD = {masked_secret(DB_PASSWORD)}")
     print(f"  API_KEY = {masked_secret(API_KEY)}")
