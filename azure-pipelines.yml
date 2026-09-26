@@ -29,7 +29,7 @@ variables:
   drHostPort: '3002'
   selfHostedPool: drlab-ec2
   # --- set these after running azure/create-azure.sh ---
-  azureWebAppName: drlab-py39-CHANGEME
+  azureWebAppName: drlab-py39-zjiav
   azureServiceConnection: sc-drlab-azure
   # ADO Library variable group holding DB_PASSWORD and API_KEY (locked, secret).
   # Plain variable group, NOT Key Vault-linked (Key Vault is assumed down in DR).
@@ -148,8 +148,8 @@ stages:
                 printf '%s' "$val" | sudo install -m 600 -o root -g root /dev/stdin "$SEC/$name"
                 echo "   $name written"
               }
-              write_secret DB_PASSWORD "$SECRET_DB_PASSWORD"
-              write_secret API_KEY     "$SECRET_API_KEY"
+              write_secret DB_PASSWORD "${DR_DB_PASSWORD:-}"
+              write_secret API_KEY     "${DR_API_KEY:-}"
 
               echo "== 4. switch current -> this release, recreate container"
               sudo ln -sfn "$REL" "$BASE/current"
@@ -170,5 +170,5 @@ stages:
             displayName: Deploy code + config + secrets, docker compose up
             env:
               # Secret variables are never exposed to scripts unless mapped explicitly.
-              SECRET_DB_PASSWORD: $(DB_PASSWORD)
-              SECRET_API_KEY: $(API_KEY)
+              DR_DB_PASSWORD: $(DB_PASSWORD)
+              DR_API_KEY: $(API_KEY)
